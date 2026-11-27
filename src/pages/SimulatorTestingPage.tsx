@@ -221,21 +221,30 @@ export function SimulatorTestingPage({
 
   const handleDisconnectSim = async () => {
     setErrorBanner(null);
-    await disconnectSimulator();
-    const simDb = devices.find(
-      (d) =>
-        d.connectionType === 'simulated' ||
-        d.deviceIdentifier === 'SIM-HN-DEV-001',
-    );
-    if (simDb) {
-      await updateDeviceStatus(simDb.id, { status: 'disconnected' });
+    setStatusBanner(null);
+    try {
+      await disconnectSimulator();
+      const simDb = devices.find(
+        (d) =>
+          d.connectionType === 'simulated' ||
+          d.deviceIdentifier === 'SIM-HN-DEV-001',
+      );
+      if (simDb) {
+        await updateDeviceStatus(simDb.id, { status: 'disconnected' });
+      }
+      await logAuditEvent({
+        action: 'SIMULATED_DEVICE_DISCONNECTED',
+        entityType: 'device',
+        entityId: simDb?.id ?? 'SIM-HN-DEV-001',
+      });
+      setStatusBanner('SIMULATED Hema Nexus device disconnected.');
+    } catch (err) {
+      setErrorBanner(
+        err instanceof Error
+          ? err.message
+          : 'Failed to disconnect the simulated device.',
+      );
     }
-    await logAuditEvent({
-      action: 'SIMULATED_DEVICE_DISCONNECTED',
-      entityType: 'device',
-      entityId: simDb?.id ?? 'SIM-HN-DEV-001',
-    });
-    setStatusBanner('SIMULATED Hema Nexus device disconnected.');
   };
 
   const resolveSimDbDeviceId = (): number | null => {
@@ -259,6 +268,7 @@ export function SimulatorTestingPage({
       return;
     }
 
+    let customSecondaryValue: number | undefined;
     if (sampleMode === 'custom' && slugs.length === 1) {
       const val = Number(customPrimary);
       if (!Number.isFinite(val)) {
@@ -272,15 +282,31 @@ export function SimulatorTestingPage({
         );
         return;
       }
-      if (slugs[0] === 'blood_pressure') {
-        const sec = Number(customSecondary);
-        if (!Number.isFinite(sec)) {
-          setErrorBanner('Enter both Systolic and Diastolic values.');
+      if (bounds.secondaryMin !== undefined) {
+        if (customSecondary.trim() === '') {
+          setErrorBanner(
+            slugs[0] === 'blood_pressure'
+              ? 'Enter a diastolic value for the custom blood pressure reading.'
+              : 'Enter a pulse value for the custom SpO₂ reading.',
+          );
           return;
         }
+        const sec = Number(customSecondary);
+        if (!Number.isFinite(sec)) {
+          setErrorBanner('Enter a valid secondary numeric value.');
+          return;
+        }
+        if (sec < bounds.secondaryMin || sec > bounds.secondaryMax!) {
+          setErrorBanner(
+            `Secondary value must be within physiological bounds (${bounds.secondaryMin}–${bounds.secondaryMax}).`,
+          );
+          return;
+        }
+        customSecondaryValue = sec;
       }
     }
 
+    setSessionSaved([]);
     setBusy(true);
     const newlySaved: MeasurementRecord[] = [];
     const simDeviceId = resolveSimDbDeviceId();
@@ -299,6 +325,8 @@ export function SimulatorTestingPage({
 
       for (let i = 0; i < slugs.length; i++) {
         const slug = slugs[i];
+        const effectiveSampleMode =
+          slugs.length > 1 && sampleMode === 'custom' ? 'normal' : sampleMode;
         setActiveStageIdx(3);
         setProgressLabel(
           `Running ${slug} (${i + 1}/${slugs.length}) — SIMULATED`,
@@ -306,19 +334,14 @@ export function SimulatorTestingPage({
 
         const packet = await runSimulatedTest({
           testType: slug,
-          sampleMode:
-            slugs.length > 1 && sampleMode === 'custom'
-              ? 'normal'
-              : sampleMode,
+          sampleMode: effectiveSampleMode,
           customValue:
             sampleMode === 'custom' && slugs.length === 1
               ? Number(customPrimary)
               : undefined,
           customSecondaryValue:
-            sampleMode === 'custom' &&
-            slugs.length === 1 &&
-            customSecondary.trim() !== ''
-              ? Number(customSecondary)
+            sampleMode === 'custom' && slugs.length === 1
+              ? customSecondaryValue ?? null
               : null,
           failureMode,
           onStage: (label, pct) => {
@@ -331,7 +354,7 @@ export function SimulatorTestingPage({
         setActiveStageIdx(5);
         const dupKey =
           failureMode === 'duplicate_submission'
-            ? `sim-dup-${slug}-${selectedPatientId}`
+            ? `sim-dup-${createdSession.id}-${slug}`
             : null;
 
         setActiveStageIdx(6);
@@ -344,7 +367,7 @@ export function SimulatorTestingPage({
           deviceId: simDeviceId,
           patientRecordId,
           sessionId: activeSessionId,
-          notes: `SIMULATED (${sampleMode.toUpperCase()}) · ${selectedPatient ? `UHID ${selectedPatient.uhid}` : 'Self Profile'}`,
+          notes: `SIMULATED (${effectiveSampleMode.toUpperCase()}) · ${selectedPatient ? `UHID ${selectedPatient.uhid}` : 'Self Profile'}`,
           rawPacketHex: packet.rawPacketHex,
           explicitIdempotencyKey: dupKey,
           simulateApiFailure: failureMode === 'api_failure',
@@ -406,13 +429,23 @@ export function SimulatorTestingPage({
     } catch (err) {
       const msg =
         err instanceof Error ? err.message : 'Simulated test execution failed.';
+      setSessionSaved(newlySaved);
+      if (newlySaved.length > 0) setActiveStageIdx(7);
       setErrorBanner(msg);
       if (activeSessionId) {
-        await updateTestSession(activeSessionId, {
-          sessionStatus: 'failed',
-          completionStatus: newlySaved.length > 0 ? 'partial' : 'incomplete',
-          errorDetails: msg,
-        });
+        try {
+          await updateTestSession(activeSessionId, {
+            sessionStatus: 'failed',
+            completionStatus: newlySaved.length > 0 ? 'partial' : 'incomplete',
+            errorDetails: msg,
+          });
+        } catch (sessionError) {
+          const sessionMessage =
+            sessionError instanceof Error
+              ? sessionError.message
+              : 'Unable to update the test session status.';
+          setErrorBanner(`${msg} Session status update failed: ${sessionMessage}`);
+        }
       }
       if (simDeviceId) {
         await logDeviceEvent(simDeviceId, {
@@ -467,13 +500,20 @@ export function SimulatorTestingPage({
     reportMeasurements: MeasurementRecord[],
   ) => {
     if (!profile) return;
-    const pdf = await generateClinicalPdfReport({
-      report,
-      measurements: reportMeasurements,
-      profile,
-      testCatalog,
-    });
-    pdf.save(`${report.reportCode}.pdf`);
+    setErrorBanner(null);
+    try {
+      const pdf = await generateClinicalPdfReport({
+        report,
+        measurements: reportMeasurements,
+        profile,
+        testCatalog,
+      });
+      pdf.save(`${report.reportCode}.pdf`);
+    } catch (err) {
+      setErrorBanner(
+        err instanceof Error ? err.message : 'Failed to download the PDF report.',
+      );
+    }
   };
 
   const handleRegisterPatient = async (e: React.FormEvent) => {
@@ -755,8 +795,9 @@ export function SimulatorTestingPage({
                 ) : (
                   <button
                     type="button"
+                    disabled={busy}
                     onClick={() => void handleDisconnectSim()}
-                    className="flex-1 min-h-[44px] px-4 py-2 rounded-lg border border-rose-500/45 bg-rose-950/45 text-rose-200 hover:bg-rose-950/65 text-sm font-medium flex items-center justify-center gap-2 transition-colors whitespace-nowrap"
+                    className="flex-1 min-h-[44px] px-4 py-2 rounded-lg border border-rose-500/45 bg-rose-950/45 text-rose-200 hover:bg-rose-950/65 text-sm font-medium flex items-center justify-center gap-2 transition-colors whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <Power className="w-4 h-4" />
                     <span>Disconnect Simulator</span>
@@ -773,6 +814,7 @@ export function SimulatorTestingPage({
                       2. Target Patient Profile
                     </label>
                     <select
+                      disabled={busy}
                       value={selectedPatientId}
                       onChange={(e) => setSelectedPatientId(e.target.value)}
                       className="w-full h-10 px-3 rounded-lg border border-[#D5E0EC] dark:border-[#24364D] bg-[#F8FAFC] dark:bg-[#0D1622] text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:border-[#005EB8] dark:focus:border-sky-400"
@@ -793,6 +835,7 @@ export function SimulatorTestingPage({
                       Failure Scenario Injection
                     </label>
                     <select
+                      disabled={busy}
                       value={failureMode}
                       onChange={(e) =>
                         setFailureMode(e.target.value as FailureSimulationMode)
@@ -840,6 +883,7 @@ export function SimulatorTestingPage({
                       <button
                         key={id}
                         type="button"
+                        disabled={busy}
                         onClick={() => setSampleMode(id)}
                         className={`min-h-[40px] px-3 py-2 rounded-lg border text-xs font-medium transition-colors ${
                           sampleMode === id
@@ -966,8 +1010,9 @@ export function SimulatorTestingPage({
                   <button
                     key={t.slug}
                     type="button"
+                    disabled={busy}
                     onClick={() => setSelectedSlug(t.slug)}
-                    className={`min-h-[76px] p-3 sm:p-3.5 rounded-xl border text-left transition-colors flex flex-col justify-between ${
+                    className={`min-h-[76px] p-3 sm:p-3.5 rounded-xl border text-left transition-colors flex flex-col justify-between disabled:cursor-not-allowed disabled:opacity-60 ${
                       isSelected
                         ? 'border-amber-600 dark:border-amber-400 bg-amber-50/75 dark:bg-[#1C1608]'
                         : 'border-[#D5E0EC] dark:border-[#1E2E42] hover:border-[#005EB8]/45 dark:hover:border-sky-400/45 bg-white dark:bg-[#111B27]'

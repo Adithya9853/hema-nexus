@@ -4,6 +4,7 @@ import type {
   TransportDeviceInfo,
   TransportMeasurementPacket,
 } from './deviceTransport.ts';
+import { getPhysiologicalBounds } from '../../utils/clinicalValidation.ts';
 
 export type SimulatedSampleMode = 'normal' | 'abnormal' | 'custom';
 
@@ -287,6 +288,12 @@ class HemaSimulatedDeviceService implements DeviceTransport {
       if (customValue === undefined || !Number.isFinite(customValue)) {
         throw new Error('Enter a valid custom numeric value.');
       }
+      const bounds = getPhysiologicalBounds(testType);
+      if (customValue < bounds.min || customValue > bounds.max) {
+        throw new Error(
+          `Custom value must be between ${bounds.min} and ${bounds.max}.`,
+        );
+      }
       measuredValue = customValue;
       secondaryValue =
         customSecondaryValue !== undefined &&
@@ -294,16 +301,28 @@ class HemaSimulatedDeviceService implements DeviceTransport {
         Number.isFinite(customSecondaryValue)
           ? customSecondaryValue
           : null;
+      if (bounds.secondaryMin !== undefined) {
+        if (secondaryValue === null) {
+          throw new Error('A valid secondary value is required for this test.');
+        }
+        if (
+          secondaryValue < bounds.secondaryMin ||
+          secondaryValue > (bounds.secondaryMax ?? Number.POSITIVE_INFINITY)
+        ) {
+          throw new Error(
+            `Secondary value must be between ${bounds.secondaryMin} and ${bounds.secondaryMax}.`,
+          );
+        }
+      }
     } else {
       const profile = SAMPLE_PROFILES[testType];
       if (!profile) {
-        measuredValue = sampleMode === 'normal' ? 50 : 120;
-      } else {
-        const sample =
-          sampleMode === 'normal' ? profile.normal() : profile.abnormal();
-        measuredValue = sample.value;
-        secondaryValue = sample.secondary;
+        throw new Error(`Unsupported simulated test type: ${testType}.`);
       }
+      const sample =
+        sampleMode === 'normal' ? profile.normal() : profile.abnormal();
+      measuredValue = sample.value;
+      secondaryValue = sample.secondary;
     }
 
     return {
